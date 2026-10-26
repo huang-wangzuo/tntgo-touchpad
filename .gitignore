@@ -1,0 +1,13 @@
+# 构建产物
+build/
+*.app
+
+# 图标中间产物(icon.icns 会提交)
+icon.iconset/
+icon_1024.png
+
+# 开发签名私钥(绝不提交;换机器时私下备份)
+.devcert/
+
+# macOS
+.DS_Store
