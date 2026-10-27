@@ -147,13 +147,13 @@ final class TouchpadDriver: NSObject {
     func stop() {
         for box in boxes {
             IOHIDDeviceRegisterInputReportCallback(box.device, box.buf.assumingMemoryBound(to: UInt8.self), 64, nil, nil)
-            IOHIDDeviceUnscheduleFromRunLoop(box.device, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue as CFString)
+            IOHIDDeviceUnscheduleFromRunLoop(box.device, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue as CFString)
             IOHIDDeviceClose(box.device, IOOptionBits(0))
         }
         boxes.removeAll()
         for mgr in managers {
             IOHIDManagerClose(mgr, IOOptionBits(0))
-            IOHIDManagerUnscheduleFromRunLoop(mgr, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue as CFString)
+            IOHIDManagerUnscheduleFromRunLoop(mgr, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue as CFString)
         }
         managers.removeAll()
         contacts.removeAll()
@@ -179,8 +179,11 @@ final class TouchpadDriver: NSObject {
             Unmanaged<TouchpadDriver>.fromOpaque(ctx).takeUnretainedValue().detach(device)
         }, ctx)
 
-        // 先调度 runloop,再打开(参考 Apple HID 示例代码顺序)
-        IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue as CFString)
+        // 先调度 runloop,再打开(参考 Apple HID 示例代码顺序)。
+        // 必须注册到 commonModes:菜单/滑条等 UI 追踪期间 runloop 会切到
+        // eventTracking 模式,只注册 defaultMode 的话 HID 回调会停,
+        // 表现为"菜单一打开触摸板就死了,只能靠真鼠标"
+        IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue as CFString)
 
         let openRes = IOHIDManagerOpen(mgr, IOOptionBits(0))
         guard openRes == kIOReturnSuccess else {
@@ -197,7 +200,7 @@ final class TouchpadDriver: NSObject {
         boxes.append(box)
         let bctx = Unmanaged.passUnretained(box).toOpaque()
 
-        IOHIDDeviceScheduleWithRunLoop(device, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue as CFString)
+        IOHIDDeviceScheduleWithRunLoop(device, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue as CFString)
 
         let openRes = IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeNone))
         if debug {
@@ -231,7 +234,7 @@ final class TouchpadDriver: NSObject {
         guard let idx = boxes.firstIndex(where: { ObjectIdentifier($0.device) == ObjectIdentifier(device) }) else { return }
         let box = boxes.remove(at: idx)
         IOHIDDeviceRegisterInputReportCallback(device, box.buf.assumingMemoryBound(to: UInt8.self), 64, nil, nil)
-        IOHIDDeviceUnscheduleFromRunLoop(device, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue as CFString)
+        IOHIDDeviceUnscheduleFromRunLoop(device, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue as CFString)
         contacts.removeAll()
         scrollMode = false
         scrollEndGrace = 0
