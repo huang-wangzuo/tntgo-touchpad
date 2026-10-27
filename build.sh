@@ -12,8 +12,20 @@ swiftc -O main.swift -o build/tntgo-touchpad
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp build/tntgo-touchpad "$APP/Contents/MacOS/tntgo-touchpad"
 
-if [ -f icon.icns ]; then
-    cp icon.icns "$APP/Contents/Resources/icon.icns"
+# 图标:assets/icon.icns 缺失时,从 make-icon.swift 的产物 icon_1024.png 重新生成
+if [ ! -f assets/icon.icns ] && [ -f icon_1024.png ]; then
+    rm -rf icon.iconset
+    mkdir -p icon.iconset assets
+    for size in 16 32 128 256 512; do
+        sips -z $size $size icon_1024.png --out "icon.iconset/icon_${size}x${size}.png" >/dev/null
+        sips -z $((size * 2)) $((size * 2)) icon_1024.png --out "icon.iconset/icon_${size}x${size}@2x.png" >/dev/null
+    done
+    iconutil -c icns icon.iconset -o assets/icon.icns
+    echo "✓ 已从 icon_1024.png 重新生成 assets/icon.icns"
+fi
+
+if [ -f assets/icon.icns ]; then
+    cp assets/icon.icns "$APP/Contents/Resources/icon.icns"
 fi
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
@@ -23,7 +35,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <dict>
     <key>CFBundleName</key><string>TNT go Touchpad</string>
     <key>CFBundleDisplayName</key><string>TNT go Touchpad</string>
-    <key>CFBundleIdentifier</key><string>com.ruimin.tntgo-touchpad</string>
+    <key>CFBundleIdentifier</key><string>com.tntgo.touchpad</string>
     <key>CFBundleExecutable</key><string>tntgo-touchpad</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>1.0</string>

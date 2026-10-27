@@ -653,7 +653,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // 2. 清理本应用在 TCC 数据库中的授权记录(辅助功能 + 输入监控)
-        let bundleID = Bundle.main.bundleIdentifier ?? "com.ruimin.tntgo-touchpad"
+        let bundleID = Bundle.main.bundleIdentifier ?? "com.tntgo.touchpad"
         for service in ["Accessibility", "ListenEvent"] {
             let tcc = Process()
             tcc.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
