@@ -102,13 +102,13 @@ final class TouchpadDriver: NSObject {
     private var scrollRef: (x: Double, y: Double)?
     private var scrollMode = false
     private var scrollTravel: Double = 0
+    private var scrollEndGrace: Double = 0   // 滚动结束后的短暂静默,忽略残指微动
     private struct TapCandidate {
         var start: Double, end: Double, travel: Double, sawButton: Bool
     }
     private var tapCandidates: [TapCandidate] = []
     private var buttonDown = false
     private var leftPending = false
-    private var lastCount = 0
     private var mouseButtons: UInt8 = 0
     private var boundsCache: (rect: CGRect, at: Double)?
     private(set) var reportCount = 0
@@ -158,6 +158,7 @@ final class TouchpadDriver: NSObject {
         managers.removeAll()
         contacts.removeAll()
         scrollMode = false
+        scrollEndGrace = 0
         buttonDown = false
         leftPending = false
     }
@@ -233,6 +234,7 @@ final class TouchpadDriver: NSObject {
         IOHIDDeviceUnscheduleFromRunLoop(device, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue as CFString)
         contacts.removeAll()
         scrollMode = false
+        scrollEndGrace = 0
         buttonDown = false
         leftPending = false
         if debug { NSLog("[tntgo] HID interface detached (total \(boxes.count))") }
@@ -326,16 +328,22 @@ final class TouchpadDriver: NSObject {
         }
 
         let active = contacts.count
-        let total = max(active, count)
 
-        if total >= 2, !scrollMode {
+        // 模式切换只看真实存活的接触点:count 字节在按压物理按键时可能
+        // 毛刺(瞬间报 2),拿它当依据会让拖拽期间的移动被当滚动吞掉
+        if active >= 2, !scrollMode {
             scrollMode = true
             scrollTravel = 0
             scrollRef = nil
             moveRef = nil
         }
-        if active == 0 {
+        if scrollMode, active <= 1 {
             scrollMode = false
+            scrollRef = nil
+            moveRef = nil
+            scrollEndGrace = now + 0.15
+        }
+        if active == 0 {
             evaluateTaps(now: now)
         }
 
@@ -368,14 +376,12 @@ final class TouchpadDriver: NSObject {
                 }
                 scrollRef = (cx, cy)
             }
-        } else if total == 1, moved, let c = contacts[cid] {
+        } else if active == 1, moved, now > scrollEndGrace, let c = contacts[cid] {
             if let ref = moveRef {
                 postMove(dx: c.x - ref.x, dy: c.y - ref.y, dt: moveDt)
             }
             moveRef = (c.x, c.y)
         }
-
-        lastCount = count
     }
 
     // MARK: 轻点判定(全部手指抬起时)
@@ -482,7 +488,12 @@ final class TouchpadDriver: NSObject {
         let b = displayBounds()
         loc.x = min(max(loc.x, b.minX + 1), b.maxX - 1)
         loc.y = min(max(loc.y, b.minY + 1), b.maxY - 1)
-        CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: loc, mouseButton: .left)?
+        if debug { NSLog("[tntgo] move dx=\(dx) dy=\(dy) drag=\(buttonDown ? 1 : 0) loc=\(loc.x),\(loc.y)") }
+        // 按住拖拽时必须发 leftMouseDragged:新版 macOS 不会把合成事件里的
+        // mouseMoved 自动转译成拖拽,发 mouseMoved 会导致窗口不跟手、
+        // 松开时才跳到终点
+        let type: CGEventType = buttonDown ? .leftMouseDragged : .mouseMoved
+        CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: loc, mouseButton: .left)?
             .post(tap: .cghidEventTap)
     }
 
