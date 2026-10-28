@@ -63,6 +63,8 @@ private let kMoveAccel = 0.6         // 速度加速系数
 private let kScrollBaseGain = 2.2    // 滚动:每单位对应的像素(乘以 scrollSpeed)
 private let kTapMaxDuration = 0.18   // 轻点最长按压时间(秒)
 private let kTapMaxTravel = 45.0     // 轻点最大位移(触摸板单位)
+private let kTwoFingerSettle = 0.05  // 双指状态需持续的稳定时间,过后才开始滚动/捏合
+private let kZoomStart = 30.0        // 捏合触发所需的双指间距净变化(触摸板单位,约 1mm)
 
 // IOHID 手势事件相位(kIOHIDEventPhase*,私有头文件,值为逆向确认)
 private let kHIDPhaseBegan = 1
@@ -112,11 +114,16 @@ final class TouchpadDriver: NSObject {
     private var scrollMode = false
     private var scrollTravel: Double = 0
     private var scrollEndGrace: Double = 0   // 滚动结束后的短暂静默,忽略残指微动
-    private var pinchRef: Double?                    // 双指间距基准(捏合缩放)
+    private var pinchRef: Double?                    // 双指间距基准(捏合识别)
+    private var lastPinchDist: Double = 0            // 上一帧指距(缩放增量)
+    private var pinchTrans: Double = 0               // 基准以来质心累计平移(区分滚动与捏合)
+    private var pinchResidual: Double = 0            // 缩放增量余数(慢速捏合不丢动作)
     private var zoomStarted = false
+    private var zoomPending = false                  // 捏合触发确认:连续两帧满足条件才真正开始
+    private var twoFingerSince: Double?              // 连续双指状态起点(滚动/捏合的起判延时)
     private var swipeBase: (x: Double, y: Double)?   // 三指横滑起点质心
     private var swipeArmed = true                    // 滞回:触发后须移回起点附近才重新武装,一次滑动只切一格
-    private var swipeCount = 0                       // 上一帧指数,变化时作废所有手势基准
+    private var swipeCount = 0                       // 上一帧手指数,变化时作废所有手势基准
     private struct TapCandidate {
         var start: Double, end: Double, travel: Double, sawButton: Bool
     }
@@ -174,7 +181,11 @@ final class TouchpadDriver: NSObject {
         scrollMode = false
         scrollEndGrace = 0
         pinchRef = nil
+        pinchTrans = 0
+        pinchResidual = 0
         zoomStarted = false
+        zoomPending = false
+        twoFingerSince = nil
         swipeBase = nil
         swipeArmed = true
         buttonDown = false
@@ -257,7 +268,11 @@ final class TouchpadDriver: NSObject {
         scrollMode = false
         scrollEndGrace = 0
         pinchRef = nil
+        pinchTrans = 0
+        pinchResidual = 0
         zoomStarted = false
+        zoomPending = false
+        twoFingerSince = nil
         swipeBase = nil
         swipeArmed = true
         buttonDown = false
@@ -363,6 +378,8 @@ final class TouchpadDriver: NSObject {
             moveRef = nil
             pinchRef = nil
             swipeBase = nil
+            twoFingerSince = nil
+            zoomPending = false
         }
         if scrollMode, active <= 1 {
             scrollMode = false
@@ -375,6 +392,8 @@ final class TouchpadDriver: NSObject {
             }
             pinchRef = nil
             swipeBase = nil
+            twoFingerSince = nil
+            zoomPending = false
         }
         if active == 0 {
             evaluateTaps(now: now)
@@ -396,37 +415,82 @@ final class TouchpadDriver: NSObject {
             }
         }
 
-        // 移动 / 滚动 / 缩放 / 三指横滑
+        // 移动 / 滚动 / 缩放 / 三指轻扫
         if scrollMode {
             if contacts.count != swipeCount {
                 swipeCount = contacts.count
-                scrollRef = nil             // 指数变化瞬间质心/间距会跳,基准全部作废
+                scrollRef = nil             // 手指数变化瞬间质心/间距会跳,基准全部作废
                 pinchRef = nil
                 swipeBase = nil
+                twoFingerSince = nil
+                zoomPending = false
+                pinchResidual = 0
             }
             let n = Double(contacts.count)
             let cx = contacts.values.reduce(0.0) { $0 + $1.x } / n
             let cy = contacts.values.reduce(0.0) { $0 + $1.y } / n
             if contacts.count == 2 {
-                // 双指:滚动(质心位移)+ 捏合缩放(间距变化),与原生触摸板一致
+                // 双指:滚动(质心位移)+ 捏合缩放(间距变化)。
+                // 起滚/起捏都要求双指状态已持续片刻:三指手势落指/抬指时会短暂
+                // 经过双指状态,立刻起滚会把三指轻扫误判成滚动
+                if twoFingerSince == nil { twoFingerSince = now }
+                let settled = now - twoFingerSince! >= kTwoFingerSettle
+                var ddx = 0.0, ddy = 0.0
                 if let ref = scrollRef {
-                    let ddx = cx - ref.x, ddy = cy - ref.y
+                    ddx = cx - ref.x
+                    ddy = cy - ref.y
+                }
+                scrollRef = (cx, cy)
+
+                // 捏合识别:指距相对基准的"净变化"要够大,且径向变化须主导
+                // 质心平移 —— 纯滚动时两指不完全平行的指距漂移既不够大也不占
+                // 主导,不会累积成缩放;触发还需连续两帧满足,挡住抬指瞬间跳变
+                let pts = Array(contacts.values)
+                let dist = hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y)
+                if let ref = pinchRef {
+                    pinchTrans += hypot(ddx, ddy)
+                    let radial = dist - ref
+                    let dd = dist - lastPinchDist
+                    if zoomStarted {
+                        pinchResidual += dd
+                        if abs(pinchResidual) > 0.4 {
+                            scrollTravel += abs(pinchResidual)
+                            postZoom(pinchResidual / max(lastPinchDist, 1), phase: kHIDPhaseChanged)
+                            pinchResidual = 0
+                        }
+                    } else {
+                        scrollTravel += abs(dd)   // 有过指距变化就不误判成轻点
+                        if settled, dist > 30, abs(radial) > kZoomStart, abs(radial) > pinchTrans * 0.5 {
+                            if zoomPending {
+                                postZoom(0, phase: kHIDPhaseBegan)
+                                zoomStarted = true
+                                zoomPending = false
+                            } else {
+                                zoomPending = true   // 第一帧只登记,下一帧仍满足才触发
+                            }
+                        } else {
+                            zoomPending = false
+                            if pinchTrans > 120, abs(radial) < pinchTrans * 0.4 {
+                                // 平移主导 = 纯滚动:重置捏合基准,
+                                // 滚动一段时间后接着捏合仍然能触发
+                                pinchRef = dist
+                                pinchTrans = 0
+                            }
+                        }
+                    }
+                    lastPinchDist = dist
+                } else {
+                    pinchRef = dist
+                    lastPinchDist = dist
+                    pinchTrans = 0
+                }
+
+                if settled {
                     scrollTravel += hypot(ddx, ddy)
                     postScroll(dx: ddx, dy: ddy)
                 }
-                scrollRef = (cx, cy)
-                let pts = Array(contacts.values)
-                let dist = hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y)
-                if let ref = pinchRef, dist > 1, abs(dist - ref) > 3 {
-                    let mag = (dist - ref) / ref
-                    scrollTravel += abs(dist - ref)   // 有过缩放就不误判成轻点
-                    postZoom(mag, phase: zoomStarted ? kHIDPhaseChanged : kHIDPhaseBegan)
-                    zoomStarted = true
-                    pinchRef = dist
-                } else if pinchRef == nil {
-                    pinchRef = dist
-                }
             } else {
+                twoFingerSince = nil
                 // 三指及以上轻扫,与原生触摸板一致;此时不滚动:
                 //   左右滑 = 切换桌面(⌃←/⌃→)  上滑 = 调度中心(⌃↑)  下滑 = 应用曝光(⌃↓)
                 if let base = swipeBase {
