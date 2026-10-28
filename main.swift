@@ -8,6 +8,8 @@
 //  本程序直接读取原始多点触控报告并翻译成 CGEvent 鼠标事件:
 //    单指移动(带速度加速) / 物理按下点击 / 双指滚动(跟随系统"自然滚动"设置)
 //    单指轻点 = 左键,双指轻点 = 右键,两次轻点 = 双击
+//    双指捏合 = 缩放(合成原生 magnify 手势)
+//    三指横滑 = 切换桌面(合成系统默认快捷键 ⌃←/⌃→)
 //  同时兼容设备可能输出的相对鼠标模式(report ID 10)。
 //
 //  需要辅助功能权限(首次运行时通过菜单引导授权)。
@@ -62,6 +64,15 @@ private let kScrollBaseGain = 2.2    // 滚动:每单位对应的像素(乘以 s
 private let kTapMaxDuration = 0.18   // 轻点最长按压时间(秒)
 private let kTapMaxTravel = 45.0     // 轻点最大位移(触摸板单位)
 
+// IOHID 手势事件相位(kIOHIDEventPhase*,私有头文件,值为逆向确认)
+private let kHIDPhaseBegan = 1
+private let kHIDPhaseChanged = 2
+private let kHIDPhaseEnded = 4
+
+// 三指横滑切换桌面:暂不启用 —— 只有单个桌面时 ⌃←/⌃→ 无任何效果。
+// 开始使用多个桌面后改回 true 即可启用。
+private let kSpaceSwitchEnabled = false
+
 // MARK: - 每个 HID 接口的上下文
 
 final class DeviceBox {
@@ -103,6 +114,11 @@ final class TouchpadDriver: NSObject {
     private var scrollMode = false
     private var scrollTravel: Double = 0
     private var scrollEndGrace: Double = 0   // 滚动结束后的短暂静默,忽略残指微动
+    private var pinchRef: Double?                    // 双指间距基准(捏合缩放)
+    private var zoomStarted = false
+    private var swipeBase: (x: Double, y: Double)?   // 三指横滑起点质心
+    private var swipeArmed = true                    // 滞回:触发后须移回起点附近才重新武装,一次滑动只切一格
+    private var swipeCount = 0                       // 上一帧指数,变化时作废所有手势基准
     private struct TapCandidate {
         var start: Double, end: Double, travel: Double, sawButton: Bool
     }
@@ -159,6 +175,10 @@ final class TouchpadDriver: NSObject {
         contacts.removeAll()
         scrollMode = false
         scrollEndGrace = 0
+        pinchRef = nil
+        zoomStarted = false
+        swipeBase = nil
+        swipeArmed = true
         buttonDown = false
         leftPending = false
     }
@@ -238,6 +258,10 @@ final class TouchpadDriver: NSObject {
         contacts.removeAll()
         scrollMode = false
         scrollEndGrace = 0
+        pinchRef = nil
+        zoomStarted = false
+        swipeBase = nil
+        swipeArmed = true
         buttonDown = false
         leftPending = false
         if debug { NSLog("[tntgo] HID interface detached (total \(boxes.count))") }
@@ -339,12 +363,20 @@ final class TouchpadDriver: NSObject {
             scrollTravel = 0
             scrollRef = nil
             moveRef = nil
+            pinchRef = nil
+            swipeBase = nil
         }
         if scrollMode, active <= 1 {
             scrollMode = false
             scrollRef = nil
             moveRef = nil
             scrollEndGrace = now + 0.15
+            if zoomStarted {
+                postZoom(0, phase: kHIDPhaseEnded)
+                zoomStarted = false
+            }
+            pinchRef = nil
+            swipeBase = nil
         }
         if active == 0 {
             evaluateTaps(now: now)
@@ -366,18 +398,50 @@ final class TouchpadDriver: NSObject {
             }
         }
 
-        // 移动 / 滚动
+        // 移动 / 滚动 / 缩放 / 三指横滑
         if scrollMode {
-            if contacts.count >= 2 {
-                let n = Double(contacts.count)
-                let cx = contacts.values.reduce(0.0) { $0 + $1.x } / n
-                let cy = contacts.values.reduce(0.0) { $0 + $1.y } / n
+            if contacts.count != swipeCount {
+                swipeCount = contacts.count
+                scrollRef = nil             // 指数变化瞬间质心/间距会跳,基准全部作废
+                pinchRef = nil
+                swipeBase = nil
+            }
+            let n = Double(contacts.count)
+            let cx = contacts.values.reduce(0.0) { $0 + $1.x } / n
+            let cy = contacts.values.reduce(0.0) { $0 + $1.y } / n
+            if contacts.count == 2 {
+                // 双指:滚动(质心位移)+ 捏合缩放(间距变化),与原生触摸板一致
                 if let ref = scrollRef {
                     let ddx = cx - ref.x, ddy = cy - ref.y
                     scrollTravel += hypot(ddx, ddy)
                     postScroll(dx: ddx, dy: ddy)
                 }
                 scrollRef = (cx, cy)
+                let pts = Array(contacts.values)
+                let dist = hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y)
+                if let ref = pinchRef, dist > 1, abs(dist - ref) > 3 {
+                    let mag = (dist - ref) / ref
+                    scrollTravel += abs(dist - ref)   // 有过缩放就不误判成轻点
+                    postZoom(mag, phase: zoomStarted ? kHIDPhaseChanged : kHIDPhaseBegan)
+                    zoomStarted = true
+                    pinchRef = dist
+                } else if pinchRef == nil {
+                    pinchRef = dist
+                }
+            } else {
+                // 三指及以上:横滑切换桌面;此时不滚动(与原生行为一致)
+                if let base = swipeBase {
+                    let dx = cx - base.x, dy = cy - base.y
+                    if kSpaceSwitchEnabled, swipeArmed, abs(dx) > 180, abs(dx) > abs(dy) * 1.5 {
+                        postSpaceSwitch(left: dx < 0)
+                        swipeArmed = false
+                    } else if !swipeArmed, abs(dx) < 60 {
+                        swipeArmed = true   // 拉回起点附近可再次触发(不必抬手)
+                    }
+                } else {
+                    swipeBase = (cx, cy)
+                    swipeArmed = true
+                }
             }
         } else if active == 1, moved, now > scrollEndGrace, let c = contacts[cid] {
             if let ref = moveRef {
@@ -515,6 +579,33 @@ final class TouchpadDriver: NSObject {
                             wheel1: iy, wheel2: ix, wheel3: 0) {
             ev.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
             ev.post(tap: .cghidEventTap)
+        }
+    }
+
+    /// 合成原生 magnify(捏合缩放)手势。方案同 mac-mouse-fix(源自
+    /// CalfTrail 逆向):在 type=29(gesture)的事件上设置私有 IOHID 字段
+    ///   110 = 子类型(8 = Zoom)  113 = 缩放增量  132 = 相位
+    private func postZoom(_ mag: Double, phase: Int) {
+        if debug { NSLog("[tntgo] zoom mag=\(String(format: "%.4f", mag)) phase=\(phase)") }
+        guard let ev = CGEvent(source: nil) else { return }
+        ev.setIntegerValueField(CGEventField(rawValue: 55)!, value: 29)
+        ev.setIntegerValueField(CGEventField(rawValue: 110)!, value: 8)
+        ev.setIntegerValueField(CGEventField(rawValue: 132)!, value: Int64(phase))
+        ev.setDoubleValueField(CGEventField(rawValue: 113)!, value: mag)
+        ev.post(tap: .cghidEventTap)
+    }
+
+    /// 三指横滑 → 切换桌面:合成系统默认快捷键 ⌃←/⌃→(纯公开 API)。
+    /// 原生手势通道是私有接口且各版本行为不稳,快捷键方案最可靠。
+    private func postSpaceSwitch(left: Bool) {
+        if debug { NSLog("[tntgo] space switch left=\(left)") }
+        let key: CGKeyCode = left ? 123 : 124   // ← / →
+        let src = CGEventSource(stateID: .combinedSessionState)
+        for down in [true, false] {
+            if let ev = CGEvent(keyboardEventSource: src, virtualKey: key, keyDown: down) {
+                ev.flags = .maskControl
+                ev.post(tap: .cghidEventTap)
+            }
         }
     }
 
