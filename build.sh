@@ -44,6 +44,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSUIElement</key><true/>
     <key>NSPrincipalClass</key><string>NSApplication</string>
+    <!-- 三指轻扫经 System Events 发送系统快捷键,首次使用会弹一次授权 -->
+    <key>NSAppleEventsUsageDescription</key>
+    <string>三指轻扫手势需要通过 System Events 发送调度中心/切换桌面等系统快捷键。</string>
 </dict>
 </plist>
 PLIST

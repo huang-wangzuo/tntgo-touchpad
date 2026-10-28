@@ -9,7 +9,7 @@
 //    单指移动(带速度加速) / 物理按下点击 / 双指滚动(跟随系统"自然滚动"设置)
 //    单指轻点 = 左键,双指轻点 = 右键,两次轻点 = 双击
 //    双指捏合 = 缩放(合成原生 magnify 手势)
-//    三指横滑 = 切换桌面(合成系统默认快捷键 ⌃←/⌃→)
+//    三指轻扫 = 横滑切换桌面 / 上滑调度中心 / 下滑应用曝光(经 System Events 发快捷键)
 //  同时兼容设备可能输出的相对鼠标模式(report ID 10)。
 //
 //  需要辅助功能权限(首次运行时通过菜单引导授权)。
@@ -69,9 +69,7 @@ private let kHIDPhaseBegan = 1
 private let kHIDPhaseChanged = 2
 private let kHIDPhaseEnded = 4
 
-// 三指横滑切换桌面:暂不启用 —— 只有单个桌面时 ⌃←/⌃→ 无任何效果。
-// 开始使用多个桌面后改回 true 即可启用。
-private let kSpaceSwitchEnabled = false
+// 三指轻扫通过合成系统默认快捷键实现:⌃←/⌃→ 切桌面、⌃↑ 调度中心、⌃↓ 应用曝光
 
 // MARK: - 每个 HID 接口的上下文
 
@@ -429,14 +427,18 @@ final class TouchpadDriver: NSObject {
                     pinchRef = dist
                 }
             } else {
-                // 三指及以上:横滑切换桌面;此时不滚动(与原生行为一致)
+                // 三指及以上轻扫,与原生触摸板一致;此时不滚动:
+                //   左右滑 = 切换桌面(⌃←/⌃→)  上滑 = 调度中心(⌃↑)  下滑 = 应用曝光(⌃↓)
                 if let base = swipeBase {
                     let dx = cx - base.x, dy = cy - base.y
-                    if kSpaceSwitchEnabled, swipeArmed, abs(dx) > 180, abs(dx) > abs(dy) * 1.5 {
-                        postSpaceSwitch(left: dx < 0)
+                    let horiz = abs(dx) > 180 && abs(dx) > abs(dy) * 1.5
+                    let vert = abs(dy) > 180 && abs(dy) > abs(dx) * 1.5
+                    if swipeArmed, horiz || vert {
+                        if vert { postHotkey(dy < 0 ? 126 : 125) }
+                        else { postSpaceSwitch(left: dx < 0) }
                         swipeArmed = false
-                    } else if !swipeArmed, abs(dx) < 60 {
-                        swipeArmed = true   // 拉回起点附近可再次触发(不必抬手)
+                    } else if !swipeArmed, abs(dx) < 60, abs(dy) < 60 {
+                        swipeArmed = true   // 移回起点附近可再次触发(不必抬手)
                     }
                 } else {
                     swipeBase = (cx, cy)
@@ -598,13 +600,28 @@ final class TouchpadDriver: NSObject {
     /// 三指横滑 → 切换桌面:合成系统默认快捷键 ⌃←/⌃→(纯公开 API)。
     /// 原生手势通道是私有接口且各版本行为不稳,快捷键方案最可靠。
     private func postSpaceSwitch(left: Bool) {
-        if debug { NSLog("[tntgo] space switch left=\(left)") }
-        let key: CGKeyCode = left ? 123 : 124   // ← / →
-        let src = CGEventSource(stateID: .combinedSessionState)
-        for down in [true, false] {
-            if let ev = CGEvent(keyboardEventSource: src, virtualKey: key, keyDown: down) {
-                ev.flags = .maskControl
-                ev.post(tap: .cghidEventTap)
+        postHotkey(left ? 123 : 124)   // ⌃← / ⌃→
+    }
+
+    /// 发送带 ⌃ 修饰键的按键(调度中心/应用曝光/切桌面等系统快捷键)。
+    /// 必须经 System Events(AppleScript)转发:新版 macOS(macOS 26 实测)对普通
+    /// 进程直接 CGEventPost 的键盘事件不再触发系统快捷键 —— 事件带修饰键正常
+    /// 进入会话事件流,但 Dock 不认领;System Events 的特权通道仍然有效。
+    /// AppleScript 失败时退回直接 CGEventPost(旧系统上这条路是好使的)。
+    private func postHotkey(_ key: CGKeyCode) {
+        let names = [123: "⌃←", 124: "⌃→", 125: "⌃↓", 126: "⌃↑"]
+        if debug { NSLog("[tntgo] hotkey \(names[Int(key)] ?? "\(key)")") }
+        let script = NSAppleScript(source: "tell application \"System Events\" to key code \(key) using control down")
+        var err: NSDictionary?
+        script?.executeAndReturnError(&err)
+        if let err {
+            if debug { NSLog("[tntgo] applescript error: \(err),退回 CGEvent 直发") }
+            let src = CGEventSource(stateID: .combinedSessionState)
+            for down in [true, false] {
+                if let ev = CGEvent(keyboardEventSource: src, virtualKey: key, keyDown: down) {
+                    ev.flags = .maskControl
+                    ev.post(tap: .cghidEventTap)
+                }
             }
         }
     }
