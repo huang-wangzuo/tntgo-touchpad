@@ -6,7 +6,7 @@
 //  macOS 不会为第三方 digitizer 触摸板创建指针服务,所以原生无法使用。
 //
 //  本程序直接读取原始多点触控报告并翻译成 CGEvent 鼠标事件:
-//    单指移动(带速度加速) / 物理按下点击 / 双指滚动(跟随系统"自然滚动"设置)
+//    单指移动(带速度加速) / 物理按下点击 / 双指滚动(带惯性,跟随系统"自然滚动"设置)
 //    单指轻点 = 左键,双指轻点 = 右键,两次轻点 = 双击
 //    双指捏合 = 缩放(合成原生 magnify 手势)
 //    三指轻扫 = 横滑切换桌面 / 上滑调度中心 / 下滑应用曝光(经 System Events 发快捷键)
@@ -65,6 +65,9 @@ private let kTapMaxDuration = 0.18   // 轻点最长按压时间(秒)
 private let kTapMaxTravel = 45.0     // 轻点最大位移(触摸板单位)
 private let kTwoFingerSettle = 0.05  // 双指状态需持续的稳定时间,过后才开始滚动/捏合
 private let kZoomStart = 30.0        // 捏合触发所需的双指间距净变化(触摸板单位,约 1mm)
+private let kMomentumMinSpeed = 150.0 // 触发惯性滚动所需的最小抬指速度(单位/秒)
+private let kMomentumTau = 0.4        // 惯性滚动衰减时间常数(秒)
+private let kMomentumStop = 40.0      // 惯性速度降到该值即停止(单位/秒)
 
 // IOHID 手势事件相位(kIOHIDEventPhase*,私有头文件,值为逆向确认)
 private let kHIDPhaseBegan = 1
@@ -114,6 +117,11 @@ final class TouchpadDriver: NSObject {
     private var scrollMode = false
     private var scrollTravel: Double = 0
     private var scrollEndGrace: Double = 0   // 滚动结束后的短暂静默,忽略残指微动
+    private var scrollSamples: [(t: Double, dx: Double, dy: Double)] = []  // 近端滚动增量,抬指时算惯性初速度
+    private var scrollResidualX = 0.0, scrollResidualY = 0.0               // 亚像素滚动余数(慢速/惯性尾段不丢帧)
+    private var momentumTimer: Timer?
+    private var momentumVel: (x: Double, y: Double) = (0, 0)               // 惯性滚动速度(单位/秒)
+    private var momentumLast = 0.0
     private var pinchRef: Double?                    // 双指间距基准(捏合识别)
     private var lastPinchDist: Double = 0            // 上一帧指距(缩放增量)
     private var pinchTrans: Double = 0               // 基准以来质心累计平移(区分滚动与捏合)
@@ -180,6 +188,8 @@ final class TouchpadDriver: NSObject {
         contacts.removeAll()
         scrollMode = false
         scrollEndGrace = 0
+        cancelMomentum()
+        scrollSamples.removeAll()
         pinchRef = nil
         pinchTrans = 0
         pinchResidual = 0
@@ -267,6 +277,8 @@ final class TouchpadDriver: NSObject {
         contacts.removeAll()
         scrollMode = false
         scrollEndGrace = 0
+        cancelMomentum()
+        scrollSamples.removeAll()
         pinchRef = nil
         pinchTrans = 0
         pinchResidual = 0
@@ -354,6 +366,7 @@ final class TouchpadDriver: NSObject {
             } else {
                 contacts[cid] = Contact(x: x, y: y, sx: x, sy: y, start: now, last: now, travel: 0, sawButton: button)
                 moveRef = nil
+                cancelMomentum()   // 手指重新触板即停住惯性(与原生触摸板一致)
             }
         } else if let c = contacts.removeValue(forKey: cid) {
             tapCandidates.append(TapCandidate(start: c.start, end: now, travel: c.travel, sawButton: c.sawButton))
@@ -382,6 +395,7 @@ final class TouchpadDriver: NSObject {
             zoomPending = false
         }
         if scrollMode, active <= 1 {
+            let wasZooming = zoomStarted
             scrollMode = false
             scrollRef = nil
             moveRef = nil
@@ -394,6 +408,8 @@ final class TouchpadDriver: NSObject {
             swipeBase = nil
             twoFingerSince = nil
             zoomPending = false
+            if !wasZooming { startMomentum(now: now) }   // 快速上抛 → 惯性滚动
+            scrollSamples.removeAll()
         }
         if active == 0 {
             evaluateTaps(now: now)
@@ -403,6 +419,7 @@ final class TouchpadDriver: NSObject {
         if button != buttonDown {
             buttonDown = button
             if button {
+                cancelMomentum()
                 if active >= 2 {
                     postClick(right: true)          // 双指 + 按下 = 右键
                 } else {
@@ -425,6 +442,7 @@ final class TouchpadDriver: NSObject {
                 twoFingerSince = nil
                 zoomPending = false
                 pinchResidual = 0
+                scrollSamples.removeAll()   // 进入/离开三指状态不延续惯性
             }
             let n = Double(contacts.count)
             let cx = contacts.values.reduce(0.0) { $0 + $1.x } / n
@@ -488,6 +506,8 @@ final class TouchpadDriver: NSObject {
                 if settled {
                     scrollTravel += hypot(ddx, ddy)
                     postScroll(dx: ddx, dy: ddy)
+                    scrollSamples.append((now, ddx, ddy))
+                    while let first = scrollSamples.first, now - first.t > 0.12 { scrollSamples.removeFirst() }
                 }
             } else {
                 twoFingerSince = nil
@@ -511,7 +531,11 @@ final class TouchpadDriver: NSObject {
             }
         } else if active == 1, moved, now > scrollEndGrace, let c = contacts[cid] {
             if let ref = moveRef {
-                postMove(dx: c.x - ref.x, dy: c.y - ref.y, dt: moveDt)
+                let mdx = c.x - ref.x, mdy = c.y - ref.y
+                // 残留手指在主动移动 = 用户在用板,停住惯性(正常抬指的
+                // 10~20ms 交错期残指基本静止,不会误杀惯性)
+                if momentumTimer != nil, hypot(mdx, mdy) > 10 { cancelMomentum() }
+                postMove(dx: mdx, dy: mdy, dt: moveDt)
             }
             moveRef = (c.x, c.y)
         }
@@ -637,15 +661,56 @@ final class TouchpadDriver: NSObject {
         let natural = Settings.shared.naturalScroll != Settings.shared.reverseScroll
         let sign: Double = natural ? 1 : -1
         let gain = kScrollBaseGain * Settings.shared.scrollSpeed
-        let vy = dy * gain * sign
-        let vx = dx * gain * sign
-        let iy = Int32(vy.rounded()), ix = Int32(vx.rounded())
+        // 亚像素余数累积:慢速滚动与惯性尾段的小增量不因取整丢失
+        scrollResidualY += dy * gain * sign
+        scrollResidualX += dx * gain * sign
+        let iy = Int32(scrollResidualY.rounded()), ix = Int32(scrollResidualX.rounded())
         guard iy != 0 || ix != 0 else { return }
+        scrollResidualY -= Double(iy)
+        scrollResidualX -= Double(ix)
         if let ev = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2,
                             wheel1: iy, wheel2: ix, wheel3: 0) {
             ev.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
             ev.post(tap: .cghidEventTap)
         }
+    }
+
+    // MARK: 惯性滚动(与原生触摸板一致:快速上抛后内容继续滚动并指数衰减)
+
+    /// 双指抬起时若末段速度够快,启动惯性滚动
+    private func startMomentum(now: Double) {
+        cancelMomentum()
+        let recent = scrollSamples.filter { now - $0.t < 0.1 }
+        guard recent.count >= 3, let first = recent.first, let last = recent.last else { return }
+        let span = max(last.t - first.t, 0.03)
+        let vx = recent.reduce(0.0) { $0 + $1.dx } / span
+        let vy = recent.reduce(0.0) { $0 + $1.dy } / span
+        guard hypot(vx, vy) > kMomentumMinSpeed else { return }
+        momentumVel = (vx, vy)
+        momentumLast = now
+        let timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 90, repeats: true) { [weak self] _ in
+            self?.momentumTick()
+        }
+        RunLoop.main.add(timer, forMode: .common)   // 菜单追踪期间惯性不停
+        momentumTimer = timer
+    }
+
+    private func momentumTick() {
+        let now = ProcessInfo.processInfo.systemUptime
+        let dt = min(max(now - momentumLast, 0.001), 0.05)
+        momentumLast = now
+        postScroll(dx: momentumVel.x * dt, dy: momentumVel.y * dt)
+        let decay = exp(-dt / kMomentumTau)
+        momentumVel.x *= decay
+        momentumVel.y *= decay
+        if hypot(momentumVel.x, momentumVel.y) < kMomentumStop {
+            cancelMomentum()
+        }
+    }
+
+    private func cancelMomentum() {
+        momentumTimer?.invalidate()
+        momentumTimer = nil
     }
 
     /// 合成原生 magnify(捏合缩放)手势。方案同 mac-mouse-fix(源自
